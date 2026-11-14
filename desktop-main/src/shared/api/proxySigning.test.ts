@@ -3,7 +3,7 @@ import { signWithSecret as desktopSign } from "../../../electron/crypto";
 import {
   signRequestHeaders,
   signWithSecret as proxySign,
-} from "../../../api/[...path]";
+} from "../../../server/iris-signer";
 
 describe("vercel proxy signer", () => {
   it("matches the desktop canonical signature", () => {

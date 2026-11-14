@@ -1,7 +1,9 @@
 export const DEFAULT_PRIMARY_API = "https://api.tryliner.fun";
 
 /**
- * Same-origin serverless proxy (`api/[...path].ts` on Vercel). The proxy signs
+ * Same-origin serverless proxy (`api/index.ts` on Vercel, reached through the
+ * `/api/(.*)` rewrite in vercel.json because plain functions have no catch-all).
+ * The proxy signs
  * the request with the Iris HMAC scheme and adds CORS, which a browser cannot
  * do on its own.
  */

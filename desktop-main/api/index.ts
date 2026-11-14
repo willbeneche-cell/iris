@@ -1,7 +1,6 @@
-import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { SIGNER_WASM_BASE64 } from "../electron/signer";
+import { signRequestHeaders } from "../server/iris-signer";
 
 /**
  * `/api/*` reverse proxy for the browser build.
@@ -11,14 +10,12 @@ import { SIGNER_WASM_BASE64 } from "../electron/signer";
  * forwards the call to the Iris API with the same HMAC headers and answers with
  * an open CORS policy.
  *
- * Signature scheme (see electron/crypto.ts):
- *   canonical = METHOD \n path-without-query \n timestamp \n nonce \n sha256hex(body)
- *   signature = base64url(HMAC-SHA256(secret, canonical))
+ * Everything it needs lives inside the deployed project (`server/`), so there is
+ * no import that could resolve outside the Vercel build.
  *
- * The secret is either `IRIS_SIGNING_SECRET` (or `LINER_SIGNING_SECRET`) when
- * the deployment has it, or the obfuscated production key inside the signer
- * WASM that already ships with the app, so the proxy works without copying any
- * secret into Vercel.
+ * Routing: a plain Vercel function has no `[...path]` catch-all (that syntax is
+ * Next.js only), so every `/api/*` request is rewritten to this single entry
+ * point by vercel.json, and the original path is restored below.
  */
 
 const DEFAULT_UPSTREAM = "https://api.tryliner.fun";
@@ -26,16 +23,9 @@ const PROXY_PREFIX = "/api";
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (compatible; IrisPWA/1.0; +https://vercel.app)";
 
-const UPSTREAM = (process.env.IRIS_API_UPSTREAM ?? DEFAULT_UPSTREAM).replace(
-  /\/+$/,
-  "",
-);
-
-const SIGNING_SECRET = (
-  process.env.IRIS_SIGNING_SECRET ??
-  process.env.LINER_SIGNING_SECRET ??
-  ""
-).trim();
+function upstreamBase(): string {
+  return (process.env.IRIS_API_UPSTREAM ?? DEFAULT_UPSTREAM).replace(/\/+$/, "");
+}
 
 type NodeRequest = IncomingMessage & { body?: unknown };
 type NodeResponse = ServerResponse;
@@ -85,133 +75,6 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
   "x-request-id",
 ]);
 
-interface WasmSignerExports {
-  liner_alloc: (len: number) => number;
-  liner_dealloc: (ptr: number, len: number) => void;
-  liner_get_result_ptr: () => number;
-  liner_get_result_len: () => number;
-  liner_sign_request: (
-    methodPtr: number,
-    methodLen: number,
-    pathPtr: number,
-    pathLen: number,
-    bodyPtr: number,
-    bodyLen: number,
-    timestamp: bigint,
-    noncePtr: number,
-    nonceLen: number,
-  ) => number;
-  memory: WebAssembly.Memory;
-}
-
-let wasmExports: WasmSignerExports | null = null;
-
-function getWasmExports(): WasmSignerExports {
-  if (wasmExports) return wasmExports;
-  const module = new WebAssembly.Module(
-    Buffer.from(SIGNER_WASM_BASE64, "base64"),
-  );
-  wasmExports = new WebAssembly.Instance(module, {}).exports as unknown as
-    WasmSignerExports;
-  return wasmExports;
-}
-
-function passStringToWasm(
-  wasm: WasmSignerExports,
-  value: string,
-): { ptr: number; len: number; free: () => void } {
-  const bytes = Buffer.from(value, "utf8");
-  const ptr = wasm.liner_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-  return {
-    ptr,
-    len: bytes.length,
-    free: () => wasm.liner_dealloc(ptr, bytes.length),
-  };
-}
-
-function readWasmResult(wasm: WasmSignerExports): string {
-  const ptr = wasm.liner_get_result_ptr();
-  const len = wasm.liner_get_result_len();
-  if (!ptr || len === 0) return "";
-  return Buffer.from(
-    new Uint8Array(wasm.memory.buffer, ptr, len),
-  ).toString("utf8");
-}
-
-export function signWithSecret(
-  secret: string,
-  method: string,
-  path: string,
-  body: Buffer,
-  timestamp: number,
-  nonce: string,
-): string {
-  const bodySha256 = crypto.createHash("sha256").update(body).digest("hex");
-  const canonical = `${method.toUpperCase().trim()}\n${path
-    .split("?")[0]
-    .trim()}\n${timestamp}\n${nonce}\n${bodySha256}`;
-  return crypto
-    .createHmac("sha256", secret)
-    .update(canonical)
-    .digest("base64url");
-}
-
-function signWithWasm(
-  method: string,
-  path: string,
-  body: Buffer,
-  timestamp: number,
-  nonce: string,
-): string {
-  const wasm = getWasmExports();
-  const methodBuf = passStringToWasm(wasm, method);
-  const pathBuf = passStringToWasm(wasm, path.split("?")[0].trim());
-  const bodyBuf = passStringToWasm(wasm, body.toString("utf8"));
-  const nonceBuf = passStringToWasm(wasm, nonce);
-
-  try {
-    const code = wasm.liner_sign_request(
-      methodBuf.ptr,
-      methodBuf.len,
-      pathBuf.ptr,
-      pathBuf.len,
-      bodyBuf.ptr,
-      bodyBuf.len,
-      BigInt(timestamp),
-      nonceBuf.ptr,
-      nonceBuf.len,
-    );
-    if (code !== 0) {
-      throw new Error(`signer wasm rejected the request (code ${code})`);
-    }
-    return readWasmResult(wasm);
-  } finally {
-    methodBuf.free();
-    pathBuf.free();
-    bodyBuf.free();
-    nonceBuf.free();
-  }
-}
-
-export function signRequestHeaders(
-  method: string,
-  path: string,
-  body: Buffer,
-): Record<string, string> {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const nonce = crypto.randomBytes(8).toString("hex");
-  const signature = SIGNING_SECRET
-    ? signWithSecret(SIGNING_SECRET, method, path, body, timestamp, nonce)
-    : signWithWasm(method, path, body, timestamp, nonce);
-
-  return {
-    "x-liner-signature": signature,
-    "x-liner-timestamp": String(timestamp),
-    "x-liner-nonce": nonce,
-  };
-}
-
 function corsHeaders(): Record<string, string> {
   return {
     "access-control-allow-origin": "*",
@@ -222,11 +85,7 @@ function corsHeaders(): Record<string, string> {
   };
 }
 
-function sendJson(
-  res: NodeResponse,
-  status: number,
-  payload: unknown,
-): void {
+function sendJson(res: NodeResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     ...corsHeaders(),
@@ -260,12 +119,39 @@ async function readBody(req: NodeRequest): Promise<Buffer> {
   return Buffer.alloc(0);
 }
 
-function upstreamPath(url: string): string {
-  const withoutPrefix = url.startsWith(PROXY_PREFIX)
-    ? url.slice(PROXY_PREFIX.length)
-    : url;
-  const path = withoutPrefix || "/";
-  return path.startsWith("/") ? path : `/${path}`;
+/**
+ * Rebuilds the upstream path/query for a request rewritten to `/api/index`.
+ *
+ * Two shapes are supported so the proxy works whether the platform keeps the
+ * original URL (`/api/v1/tracks?limit=2`) or replaces it with the rewrite
+ * destination (`/api/index?__iris_path=v1/tracks&limit=2`).
+ */
+export function resolveUpstreamPath(requestUrl: string): string {
+  const queryIndex = requestUrl.indexOf("?");
+  const rawPath =
+    queryIndex === -1 ? requestUrl : requestUrl.slice(0, queryIndex);
+  const params = new URLSearchParams(
+    queryIndex === -1 ? "" : requestUrl.slice(queryIndex + 1),
+  );
+
+  const injected = params.get("__iris_path");
+  params.delete("__iris_path");
+
+  let path: string;
+  if (rawPath === PROXY_PREFIX || rawPath === `${PROXY_PREFIX}/index`) {
+    // rewritten to the entry point: the original path arrives as a parameter
+    path =
+      injected && injected !== "$1" && injected !== ":path*"
+        ? `/${injected.replace(/^\/+/, "")}`
+        : "/";
+  } else if (rawPath.startsWith(`${PROXY_PREFIX}/`)) {
+    path = rawPath.slice(PROXY_PREFIX.length);
+  } else {
+    path = rawPath || "/";
+  }
+
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
 }
 
 export default async function handler(
@@ -279,7 +165,7 @@ export default async function handler(
   }
 
   const method = (req.method ?? "GET").toUpperCase();
-  const pathWithQuery = upstreamPath(req.url ?? "/");
+  const pathWithQuery = resolveUpstreamPath(req.url ?? "/");
   const pathOnly = pathWithQuery.split("?")[0];
   if (!pathOnly.startsWith("/")) {
     sendJson(res, 400, { message: "Invalid API path." });
@@ -324,7 +210,7 @@ export default async function handler(
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${UPSTREAM}${pathWithQuery}`, {
+    upstream = await fetch(`${upstreamBase()}${pathWithQuery}`, {
       method,
       headers,
       ...(body.length > 0 ? { body: new Uint8Array(body) } : {}),

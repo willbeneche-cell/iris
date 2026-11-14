@@ -179,6 +179,16 @@ self.addEventListener("fetch", (event) => {
   if (url.protocol !== "http:" && url.protocol !== "https:") return;
   if (url.pathname === "/sw.js") return;
 
+  // Le proxy API (/api/*) va toujours au réseau : jamais de cache, jamais de
+  // repli vers index.html. Le service worker ne doit pas répondre du HTML à la
+  // place d'un JSON de la fonction serverless.
+  if (
+    url.origin === self.location.origin &&
+    (url.pathname === "/api" || url.pathname.startsWith("/api/"))
+  ) {
+    return;
+  }
+
   if (isCoverRequest(request.url)) {
     event.respondWith(cacheFirstCover(request).catch(() => Response.error()));
     return;
