@@ -1,4 +1,4 @@
-import { getApiBaseUrl } from "./baseUrl";
+import { getApiBaseUrl, getApiOrigin } from "./baseUrl";
 
 export type HumanCheckAction = "login" | "register";
 export type HumanCheckMode = "off" | "optional" | "required";
@@ -30,7 +30,8 @@ export function humanCheckPageUrl(action: HumanCheckAction): string {
 }
 
 export function humanCheckOrigin(): string {
-  return new URL(getApiBaseUrl()).origin;
+  // `/api` (browser proxy) is a same-origin path, not a full URL.
+  return getApiOrigin(getApiBaseUrl());
 }
 
 export function isHumanCheckMode(value: unknown): value is HumanCheckMode {

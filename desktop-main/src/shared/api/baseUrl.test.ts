@@ -17,6 +17,12 @@ describe("api base url", () => {
     );
   });
 
+  it("accepts the same-origin proxy base for the web build", () => {
+    expect(resolveApiBaseUrl("/api")).toBe("/api");
+    expect(resolveApiBaseUrl("api/")).toBe("/api");
+    expect(resolveApiBaseUrl(" /api ")).toBe("/api");
+  });
+
   it("accepts plain http only to loopback", () => {
     for (const url of [
       "http://localhost:1337",
